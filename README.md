@@ -1,5 +1,7 @@
 # WaveletSpaceNet — sparse context + a wavelet image pyramid → mesh-plane + camera pose
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/OlegJakushkin/WaveletSpaceNet/blob/main/notebooks/waveletspace_colab.ipynb)
+
 WaveletSpaceNet carries the *[Points-as-(Super)Tori](https://github.com/OlegJakushkin) /
 WaveletSurfaceNet* idea from **surfaces** to **scenes**.  The surface model reads a
 `[context | SEP | main]` token sequence (a sparse summary of the whole shape, a learned
