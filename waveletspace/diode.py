@@ -195,10 +195,22 @@ def make_episode(scene, rng, *, img_hw=256, plane_res=64, n_ctx_points=512,
                  chamfer_pts=4096):
     """One training/eval episode dict from a scene: render a random fly-through frame,
     sample noised context, and package GT pose + depth + a chamfer reference cloud."""
+    targets, _ = scene.subsample(96, rng)                # look-at candidates spanning the scene
     Rs, ts = G.flythrough(scene.centroid, scene.extent, rng, n_frames=8,
-                          n_ctrl=n_ctrl, move_frac=move_frac)
-    f = rng.integers(1, len(Rs))                         # any frame past the anchor
-    R, t = Rs[f], ts[f]
+                          n_ctrl=n_ctrl, targets=targets, move_frac=move_frac)
+    # the explore path dollies in/out and pans across the scene, so a few viewpoints frame
+    # little surface; probe candidates at low res and keep the best-filled one (usable target).
+    best_f, best_fill = int(rng.integers(0, len(Rs))), -1.0
+    Kprobe = G.intrinsics(48, 48, vfov)
+    for _ in range(5):
+        f = int(rng.integers(0, len(Rs)))
+        _, _, pm = G.splat_render(scene.P, scene.gray, Kprobe, Rs[f], ts[f], 48, 48, radius=1)
+        fill = float(pm.mean())
+        if fill > best_fill:
+            best_f, best_fill = f, fill
+        if fill > 0.12:
+            break
+    R, t = Rs[best_f], ts[best_f]
     gray, depth, mask, Kp = noised_render(scene, R, t, img_hw, plane_res, rng, vfov=vfov)
     ctx = sample_context(scene, n_ctx_points, rng, noise_frac=ctx_noise, n_outliers=n_outliers)
     sp, _ = scene.subsample(chamfer_pts, rng)

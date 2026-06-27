@@ -5,18 +5,26 @@ import torch
 from waveletspace import geometry as G, diode as D
 
 
-def test_catmull_rom_smooth_and_valid_rotations():
+def test_flythrough_smooth_valid_and_explores():
     rng = np.random.default_rng(0)
-    R, t = G.flythrough(center=np.array([0, 0, 5.0]), extent=2.0, rng=rng, n_frames=16)
-    assert R.shape == (16, 3, 3) and t.shape == (16, 3)
+    center = np.array([0, 0, 5.0]); extent = 2.0
+    targets = center + rng.normal(0, 1.0, (50, 3))           # parts of the scene to look at
+    R, t = G.flythrough(center, extent, rng, n_frames=24, targets=targets)
+    assert R.shape == (24, 3, 3) and t.shape == (24, 3)
     # every pose is a proper rotation
     for Ri in R:
         assert np.allclose(Ri @ Ri.T, np.eye(3), atol=1e-5)
         assert abs(np.linalg.det(Ri) - 1.0) < 1e-5
-    # the path is smooth: consecutive eye steps are bounded (no teleports)
+    # smooth: each interpolation step is small vs the overall path span (no teleports)
     steps = np.linalg.norm(np.diff(t, axis=0), axis=1)
-    assert steps.max() < 2.0 * 2.0          # < extent-scaled bound
-    assert t[0].tolist() == [0.0, 0.0, 0.0] or np.allclose(t[0], 0)   # starts at the anchor
+    span = np.linalg.norm(t.max(0) - t.min(0)) + 1e-6
+    assert steps.max() < span
+    # explores DISTANCE: dollies closer / pulls back -> camera-to-centre distance varies
+    dist = np.linalg.norm(t - center, axis=1)
+    assert dist.max() - dist.min() > 0.2 * extent
+    # explores ANGLE: the camera view axis turns to look at different parts
+    z = R[:, :, 2]; zmean = z.mean(0); zmean /= np.linalg.norm(zmean)
+    assert np.arccos((z * zmean).sum(1).clip(-1, 1)).max() > 0.05
 
 
 def test_unproject_project_roundtrip():
@@ -84,3 +92,14 @@ def test_real_diode_if_available():
     assert scene.P.shape[0] > 100 and scene.gray.shape[0] == scene.P.shape[0]
     ep = D.make_episode(scene, np.random.default_rng(0), img_hw=128, plane_res=64)
     assert float((ep["depth"] > 0).float().mean()) > 0.05
+    # the exploring path frames the surface from several viewpoints (≥1 well-populated),
+    # and make_episode's frame selection turns that into a usable target every time.
+    rng = np.random.default_rng(1)
+    targets, _ = scene.subsample(96, rng)
+    Rs, ts = G.flythrough(scene.centroid, scene.extent, rng, n_frames=8, targets=targets)
+    fills = [G.splat_render(scene.P, scene.gray, scene.K, Rs[i], ts[i], 96, 96, radius=1)[2].mean()
+             for i in range(len(Rs))]
+    assert max(fills) > 0.1
+    for s in range(4):                                    # every episode yields a populated depth target
+        ep = D.make_episode(scene, np.random.default_rng(100 + s), img_hw=128, plane_res=64)
+        assert float((ep["depth"] > 0).float().mean()) > 0.03

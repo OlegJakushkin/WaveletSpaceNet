@@ -155,27 +155,56 @@ def _catmull_rom(ctrl: np.ndarray, n: int) -> np.ndarray:
     return np.stack(out, 0)
 
 
-def flythrough(center, extent, rng, n_frames: int = 16, n_ctrl: int = 4,
-               eye_anchor=None, move_frac: float = 0.25, jitter: float = 0.05):
-    """A randomised smooth fly-through that keeps ``center`` in frame.
+def _basis_from_z(z: np.ndarray) -> np.ndarray:
+    """Orthonormal basis (columns x, y, z) whose third column is the unit vector ``z``."""
+    z = z / (np.linalg.norm(z) + 1e-12)
+    a = np.array([1.0, 0, 0]) if abs(z[0]) < 0.9 else np.array([0, 1.0, 0])
+    x = np.cross(a, z); x /= np.linalg.norm(x) + 1e-12
+    y = np.cross(z, x)
+    return np.stack([x, y, z], axis=1)
 
-    Control eyes are random offsets (scaled by ``extent * move_frac``) around
-    ``eye_anchor`` (default the origin = the source viewpoint); a Catmull-Rom spline
-    smooths them into ``n_frames`` eye positions; each camera looks at ``center`` with a
-    small per-frame jitter.  Returns ``(R (n,3,3), t (n,3))`` camera-to-world poses.
+
+def flythrough(center, extent, rng, n_frames: int = 16, n_ctrl: int = 5, targets=None,
+               eye_anchor=None, near: float = 0.0, far: float = 0.75, lateral_frac: float = 0.18,
+               jitter: float = 0.04, move_frac: float = 0.25):
+    """A randomised smooth fly-through that *explores* the scene — dollying closer / pulling
+    back and panning to look at different parts — while keeping the surface in view.
+
+    The scene is a single-view (2.5-D) cloud (only the front-facing surface exists), so a
+    true 360° turn-around would see nothing; instead the camera stays in the **frontal
+    frustum**, which is where coverage is actually possible.  Each control waypoint:
+
+    * picks a look-at **target** from ``targets`` (actual scene points → every part gets
+      framed in turn; falls back to ``center`` + jitter when ``targets`` is ``None``);
+    * **dollies** the eye a fraction ``[near, far]`` of the way from ``eye_anchor`` toward the
+      target (``far`` → close-up, ``near`` → wide establishing shot);
+    * adds a **lateral** offset (parallax / pan, up to ``lateral_frac``·scale) so the viewpoint
+      changes between frames without leaving the frustum.
+
+    A Catmull-Rom spline smooths the eyes *and* the targets into ``n_frames`` poses, so the
+    look-at sweeps the scene smoothly.  Returns ``(R (n,3,3), t (n,3))`` camera-to-world poses.
     """
     center = np.asarray(center, np.float64)
     eye_anchor = np.zeros(3) if eye_anchor is None else np.asarray(eye_anchor, np.float64)
-    step = float(extent) * move_frac
-    ctrl = eye_anchor[None] + rng.normal(0, step, size=(n_ctrl, 3))
-    ctrl[0] = eye_anchor                                      # start at the anchor
-    eyes = _catmull_rom(ctrl, n_frames)
-    tgt_jit = rng.normal(0, float(extent) * jitter, size=(n_frames, 3))
-    Rs, ts = [], []
-    for i in range(n_frames):
-        R = look_at(eyes[i], center + tgt_jit[i])
-        Rs.append(R); ts.append(eyes[i])
-    return np.stack(Rs, 0), np.stack(ts, 0)
+    targets = None if targets is None else np.asarray(targets, np.float64)
+    if targets is not None and len(targets) > 0:
+        T = targets[rng.integers(0, len(targets), size=n_ctrl)].copy()
+    else:
+        T = center[None] + rng.normal(0, float(extent) * move_frac, size=(n_ctrl, 3))
+    eyes = np.empty((n_ctrl, 3))
+    for k in range(n_ctrl):
+        base = T[k] - eye_anchor
+        nb = np.linalg.norm(base)
+        axis = base / nb if nb > 1e-9 else np.array([0.0, 0, 1.0])
+        B = _basis_from_z(axis)                               # x,y span the plane facing the target
+        perp = B[:, 0] * rng.normal() + B[:, 1] * rng.normal()
+        frac = rng.uniform(near, far)                         # dolly: anchor (wide) -> close-up
+        lateral = perp * rng.uniform(0.0, lateral_frac) * max(nb, float(extent))
+        eyes[k] = eye_anchor + frac * base + lateral
+    eye_path = _catmull_rom(eyes, n_frames)
+    tgt_path = _catmull_rom(T, n_frames) + rng.normal(0, float(extent) * jitter, size=(n_frames, 3))
+    Rs = [look_at(eye_path[i], tgt_path[i]) for i in range(n_frames)]
+    return np.stack(Rs, 0), eye_path
 
 
 # --------------------------------------------------------------------------- #
