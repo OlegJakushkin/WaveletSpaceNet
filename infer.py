@@ -40,7 +40,7 @@ def main():
         print(f"loaded {a.ckpt}")
     else:
         print(f"!! {a.ckpt} not found -> using an UNTRAINED model (geometry demo only)")
-        net = WaveletSpaceNet(levels=(256, 128, 64, 32), plane_res=64, d=96, M=64, L=3, heads=4)
+        net = WaveletSpaceNet(d=96, M=64, L=3, heads=4, plane_res=64, wave_levels=2, img_size=128)
     net = net.to(dev).eval()
     hw = net.img_tok.top
 

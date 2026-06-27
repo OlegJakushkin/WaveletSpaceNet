@@ -10,7 +10,9 @@ def test_train_a_few_steps_reduces_loss():
     ds = D.FlythroughDataset(None, synthetic=True, img_hw=64, plane_res=32,
                              n_ctx_points=128, length=8)
     ld = torch.utils.data.DataLoader(ds, batch_size=4, shuffle=True, collate_fn=D.collate)
-    net = WaveletSpaceNet(d=64, M=32, L=2, heads=4, levels=(64, 32), plane_res=32, n_ctx=16)
+    net = WaveletSpaceNet(d=64, M=32, L=2, heads=4, plane_res=32, wave_levels=2, win=3,
+                          n_ctx=16, img_size=64, enc_widths=(24, 32, 48, 64),
+                          enc_depths=(1, 1, 1, 1), fpn_dim=32)
     opt = torch.optim.AdamW(net.parameters(), lr=3e-3)
 
     first, last, n = None, None, 0
@@ -30,7 +32,9 @@ def test_train_a_few_steps_reduces_loss():
 
 
 def test_checkpoint_save_load(tmp_path):
-    net = WaveletSpaceNet(d=64, M=32, L=2, heads=4, levels=(64, 32), plane_res=32, n_ctx=16)
+    net = WaveletSpaceNet(d=64, M=32, L=2, heads=4, plane_res=32, wave_levels=2, win=3,
+                          n_ctx=16, img_size=64, enc_widths=(24, 32, 48, 64),
+                          enc_depths=(1, 1, 1, 1), fpn_dim=32)
     p = str(tmp_path / "ws.pt")
     save_checkpoint(net, p, epoch=3, val={"chamfer": 1.23})
     net2, ck = load_checkpoint(p)

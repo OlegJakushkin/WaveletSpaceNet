@@ -130,7 +130,14 @@ def scene_from_view(png, vfov=60.0, max_pts=60000, rng=None):
     P, idx = G.unproject_depth(depth, K, mask=valid.astype(np.float32))
     g = gray[idx[:, 0], idx[:, 1]]
     if len(P) > max_pts:
-        sel = rng.choice(len(P), max_pts, replace=False)
+        # bias the keep toward depth-discontinuity (thin / edge) points so small surfaces
+        # survive the thinning — but blend 50/50 with a uniform draw so flat regions keep
+        # their coverage (pure edge-weighting decimates walls/floor and leaves a holey GT)
+        gy, gx = np.gradient(np.log(np.clip(depth, 1e-3, None)))
+        em = np.sqrt(gx ** 2 + gy ** 2)[idx[:, 0], idx[:, 1]]
+        ew = em / (em.sum() + 1e-9) if em.sum() > 0 else np.full(len(P), 1.0 / len(P))
+        p = 0.5 * np.full(len(P), 1.0 / len(P)) + 0.5 * ew
+        sel = rng.choice(len(P), max_pts, replace=False, p=p / p.sum())
         P, g = P[sel], g[sel]
     return Scene(P, g, K, name=os.path.basename(png))
 
@@ -155,17 +162,26 @@ def noised_render(scene, R, t, img_hw, plane_res, rng, *, vfov=60.0,
                   intensity_noise=0.05, dropout=0.1, radius=1):
     """Render one fly-through frame: a noised grayscale image (``img_hw``) + GT depth/mask
     (``plane_res``).  Returns ``(gray (img_hw,img_hw), depth (plane_res,plane_res),
-    mask (plane_res,plane_res), K_plane)``."""
+    mask (plane_res,plane_res), K_plane)``.
+
+    The input render keeps the (hole-filling) ``radius`` so the encoder gets a dense frame,
+    but the GT is splatted with a **resolution-aware** radius so its *angular* splat stays
+    constant — a fixed pixel radius dilates a thin bar into a fat blob at low GT resolution
+    and merges adjacent thin features.  Dropout is **region-structured** (whole tiles) so
+    thin runs aren't perforated into noise.
+    """
     Ki = G.intrinsics(img_hw, img_hw, vfov)
     Kp = G.intrinsics(plane_res, plane_res, vfov)
     gray, _, gmask = G.splat_render(scene.P, scene.gray, Ki, R, t, img_hw, img_hw, radius=radius)
-    # noised grayscale: per-pixel gaussian noise + random dropout of splatted pixels
     gray = gray + rng.normal(0, intensity_noise, gray.shape).astype(np.float32)
-    if dropout > 0:
-        drop = rng.random(gray.shape) < dropout
+    if dropout > 0:                                          # drop whole tiles, not pixels
+        gs = 16
+        dm = rng.random((gs, gs)) < dropout
+        drop = np.repeat(np.repeat(dm, -(-img_hw // gs), 0), -(-img_hw // gs), 1)[:img_hw, :img_hw]
         gray[drop] = 0.0
     gray = np.clip(gray, 0.0, 1.0)
-    _, depth, mask = G.splat_render(scene.P, scene.gray, Kp, R, t, plane_res, plane_res, radius=radius)
+    gt_radius = max(1, int(round(plane_res / 256.0)))
+    _, depth, mask = G.splat_render(scene.P, scene.gray, Kp, R, t, plane_res, plane_res, radius=gt_radius)
     return gray.astype(np.float32), depth.astype(np.float32), mask.astype(np.float32), Kp
 
 
@@ -190,7 +206,7 @@ def sample_context(scene, n_pts, rng, *, noise_frac=0.10, n_outliers=10):
     return P.astype(np.float32)
 
 
-def make_episode(scene, rng, *, img_hw=256, plane_res=64, n_ctx_points=512,
+def make_episode(scene, rng, *, img_hw=256, plane_res=256, n_ctx_points=512,
                  vfov=60.0, ctx_noise=0.10, n_outliers=10, n_ctrl=4, move_frac=0.25,
                  chamfer_pts=4096, radius=1):
     """One training/eval episode dict from a scene: render a random fly-through frame,
@@ -198,18 +214,27 @@ def make_episode(scene, rng, *, img_hw=256, plane_res=64, n_ctx_points=512,
     targets, _ = scene.subsample(96, rng)                # look-at candidates spanning the scene
     Rs, ts = G.flythrough(scene.centroid, scene.extent, rng, n_frames=8,
                           n_ctrl=n_ctrl, targets=targets, move_frac=move_frac)
-    # the explore path dollies in/out and pans across the scene, so a few viewpoints frame
-    # little surface; probe candidates at low res and keep the best-filled one (usable target).
-    best_f, best_fill = int(rng.integers(0, len(Rs))), -1.0
+    # the explore path dollies in/out and pans across the scene.  Pick a frame by depth-EDGE
+    # density (not raw fill) so views containing object boundaries / small surfaces are
+    # favoured instead of big flat close-ups; keep a most-filled fallback so the target is
+    # never empty.
+    best_f, best_score, fill_f, best_fill = -1, -1.0, int(rng.integers(0, len(Rs))), -1.0
     Kprobe = G.intrinsics(48, 48, vfov)
-    for _ in range(5):
+    for _ in range(6):
         f = int(rng.integers(0, len(Rs)))
-        _, _, pm = G.splat_render(scene.P, scene.gray, Kprobe, Rs[f], ts[f], 48, 48, radius=1)
+        _, pd, pm = G.splat_render(scene.P, scene.gray, Kprobe, Rs[f], ts[f], 48, 48, radius=1)
         fill = float(pm.mean())
         if fill > best_fill:
-            best_f, best_fill = f, fill
-        if fill > 0.12:
-            break
+            fill_f, best_fill = f, fill
+        if fill < 0.05:
+            continue
+        gy, gx = np.gradient(pd)
+        edge = float((np.sqrt(gx ** 2 + gy ** 2) * (pm > 0.5)).mean())
+        score = edge * min(fill, 0.5)                    # favour structure, cap flat-fill reward
+        if score > best_score:
+            best_f, best_score = f, score
+    if best_f < 0:                                       # no decently-filled probe -> most filled
+        best_f = fill_f
     R, t = Rs[best_f], ts[best_f]
     gray, depth, mask, Kp = noised_render(scene, R, t, img_hw, plane_res, rng, vfov=vfov, radius=radius)
     ctx = sample_context(scene, n_ctx_points, rng, noise_frac=ctx_noise, n_outliers=n_outliers)
@@ -236,7 +261,7 @@ class FlythroughDataset(torch.utils.data.Dataset):
     synthetic scenes are generated so the pipeline runs with no data.
     """
 
-    def __init__(self, root: str | None = "auto", *, img_hw=256, plane_res=64,
+    def __init__(self, root: str | None = "auto", *, img_hw=256, plane_res=256,
                  n_ctx_points=512, vfov=60.0, ctx_noise=0.10, n_outliers=10,
                  max_scene_pts=60000, chamfer_pts=4096, length=None, seed=0,
                  synthetic=False, move_frac=0.25, views=None, radius=1):

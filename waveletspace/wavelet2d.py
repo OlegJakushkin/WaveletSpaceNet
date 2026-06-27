@@ -1,24 +1,25 @@
-"""2-D Haar wavelets + the pyramid image tokenizer.
+"""2-D Haar wavelets + multi-level analysis / synthesis for the mesh-plane decoder.
 
-The current grayscale frame is turned into a **pyramid of wavelet block tokens**:
-the image is split into non-overlapping tiles at a sequence of block sizes
-(1024, 512, 256, 128, 64, 32 by default — coarse → fine), every tile is summarised
-by its 2-D Haar coefficients, and each summary becomes one transformer token tagged
-with its pyramid level and tile centre.  This is the image-side analogue of the
-surface model's point tokens: a multi-scale, position-tagged token set that the
-Perceiver encoder reads at a cost independent of the image resolution.
+The depth field is still represented and *emitted* in the Haar wavelet domain — the
+project's thesis — but the decoder now works **multi-level** instead of a single octave.
+A depth map of side ``P`` is synthesised coarse-to-fine from a low-resolution
+approximation ``LL0`` (side ``P/2**J``) plus ``J`` detail triplets ``(LH, HL, HH)`` at
+sides ``P/2**J, …, P/2``.  Each ``idwt2d`` doubles the resolution, so a thin object gets
+its own detail coefficients at *several* scales instead of being baked into one coarse
+cell.  The same bank decomposes a ground-truth depth map into matching targets for the
+multi-level wavelet loss.
 
-The same Haar bank (orthonormal, exactly invertible) is reused by the mesh-plane
-decoder, which *emits* the 2-D Haar coefficients of the depth field and inverts
-them to a depth map.
+Image *tokenisation* used to live here too; it now lives in
+:mod:`waveletspace.encoder` (a learned conv-FPN), because average-pooling signed Haar
+detail bands destroyed exactly the small-surface information we need.
 """
 from __future__ import annotations
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
+# Kept for checkpoint-config back-compat (older cfgs may carry a ``levels`` field).
 DEFAULT_LEVELS = (1024, 512, 256, 128, 64, 32)
 
 
@@ -49,62 +50,29 @@ def idwt2d(c: torch.Tensor, w: torch.Tensor | None = None) -> torch.Tensor:
     return F.conv_transpose2d(c, w, stride=2)
 
 
-def _to_pow2(img: torch.Tensor, side: int) -> torch.Tensor:
-    """Resize a ``(B,1,H,W)`` grayscale image to ``(B,1,side,side)`` (area / bilinear)."""
-    H, W = img.shape[-2:]
-    mode = "area" if (side < H or side < W) else "bilinear"
-    kw = {} if mode == "area" else {"align_corners": False}
-    return F.interpolate(img, size=(side, side), mode=mode, **kw)
+def haar_analysis(x: torch.Tensor, levels: int, w: torch.Tensor | None = None):
+    """Decompose ``(B,1,P,P)`` into ``(LL0 (B,1,g0,g0), dets)`` where ``dets`` is a list,
+    coarsest-first, of detail triplets ``(B,3,s,s)`` at sides ``g0, 2*g0, …, P/2``.
 
-
-class WaveletPyramidTokenizer(nn.Module):
-    """Grayscale frame -> a set of multi-scale wavelet block tokens.
-
-    For each block size ``b`` in ``levels`` the (square-resized) image is cut into a
-    ``(top//b)`` × ``(top//b)`` grid of ``b×b`` tiles (``top`` = the largest level).
-    Each tile is Haar-transformed once and its 4 sub-bands are adaptive-avg-pooled to
-    ``pool×pool``; the flattened ``4*pool*pool`` summary is linearly projected to ``d``
-    and tagged with a learned level embedding plus a Fourier encoding of the tile
-    centre.  Returns ``(tokens (B, T, d), centres (B, T, 2))`` where ``centres`` are
-    tile centres in ``[-1, 1]`` (used by the decoder's local attention) and
-    ``T = sum_b (top//b)^2``.
+    Mirrors :func:`haar_synthesis`, so the depth GT can be turned into the exact targets
+    the decoder emits.
     """
+    if w is None:
+        w = haar_filters_2d(x.device, x.dtype)
+    a = x
+    dets = []
+    for _ in range(levels):
+        c = dwt2d(a, w)                       # (B,4,h/2,w/2)
+        a = c[:, :1]                          # LL approximation
+        dets.append(c[:, 1:])                 # (B,3,...)  fine -> coarse as we go down
+    return a, dets[::-1]                       # LL0, dets coarsest-first
 
-    def __init__(self, d: int = 256, levels=DEFAULT_LEVELS, pool: int = 4, fourier_bands: int = 6):
-        super().__init__()
-        self.levels = tuple(int(l) for l in levels)
-        self.top = max(self.levels)
-        assert all(self.top % b == 0 for b in self.levels), "every level must divide the top level"
-        self.pool, self.fb, self.d = pool, fourier_bands, d
-        feat = 4 * pool * pool
-        self.embed = nn.Sequential(nn.Linear(feat, d), nn.LayerNorm(d))
-        self.level_emb = nn.Parameter(torch.zeros(len(self.levels), d))
-        self.pos = nn.Sequential(nn.Linear(2 * 2 * fourier_bands, d), nn.LayerNorm(d))
-        self.register_buffer("haar", haar_filters_2d())
 
-    def n_tokens(self) -> int:
-        return sum((self.top // b) ** 2 for b in self.levels)
-
-    def forward(self, img: torch.Tensor):
-        """``img``: ``(B, 1, H, W)`` grayscale in ~[0,1] (any H, W)."""
-        from .blocks import fourier_encode
-        if img.dim() == 3:
-            img = img[:, None]
-        B = img.shape[0]
-        big = _to_pow2(img, self.top)                              # (B,1,top,top)
-        toks, cens = [], []
-        for li, b in enumerate(self.levels):
-            g = self.top // b                                      # tiles per side
-            # cut into g*g tiles of b*b -> (B*g*g, 1, b, b)
-            t = big.unfold(2, b, b).unfold(3, b, b)                # (B,1,g,g,b,b)
-            t = t.permute(0, 2, 3, 1, 4, 5).reshape(B * g * g, 1, b, b)
-            c = dwt2d(t, self.haar)                                # (B*g*g,4,b/2,b/2)
-            c = F.adaptive_avg_pool2d(c, self.pool).reshape(B, g * g, -1)   # (B,g*g,4*pool*pool)
-            tok = self.embed(c) + self.level_emb[li]
-            # tile centres in [-1,1]
-            ax = (torch.arange(g, device=img.device) + 0.5) / g * 2 - 1
-            cy, cx = torch.meshgrid(ax, ax, indexing="ij")
-            cen = torch.stack([cx, cy], -1).reshape(1, g * g, 2).expand(B, -1, -1)
-            tok = tok + self.pos(fourier_encode(cen, self.fb))
-            toks.append(tok); cens.append(cen)
-        return torch.cat(toks, 1), torch.cat(cens, 1)             # (B,T,d), (B,T,2)
+def haar_synthesis(ll0: torch.Tensor, dets, w: torch.Tensor | None = None) -> torch.Tensor:
+    """Inverse of :func:`haar_analysis`: ``LL0`` + coarsest-first ``dets`` -> ``(B,1,P,P)``."""
+    if w is None:
+        w = haar_filters_2d(ll0.device, ll0.dtype)
+    a = ll0
+    for det in dets:                          # coarsest -> finest
+        a = idwt2d(torch.cat([a, det], 1), w)
+    return a

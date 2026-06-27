@@ -1,4 +1,4 @@
-# WaveletSpaceNet — sparse context + a wavelet image pyramid → mesh-plane + camera pose
+# WaveletSpaceNet v2 — sparse context + a learned image embedding → mesh-plane + camera pose
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/OlegJakushkin/WaveletSpaceNet/blob/main/notebooks/waveletspace_colab.ipynb)
 
@@ -6,32 +6,49 @@ WaveletSpaceNet carries the *[Points-as-(Super)Tori](https://github.com/OlegJaku
 WaveletSurfaceNet* idea from **surfaces** to **scenes**.  The surface model reads a
 `[context | SEP | main]` token sequence (a sparse summary of the whole shape, a learned
 separator, the dense region) and a position-conditioned decoder *emits the Haar wavelet
-coefficients* of a distance field.  WaveletSpaceNet keeps that exact skeleton and swaps the
+coefficients* of a distance field.  WaveletSpaceNet keeps that skeleton and swaps the
 modalities:
 
 ```
-INPUT   [ sparse 3-D context points | SEP | wavelet image-pyramid tokens ]
-            (the cloud gathered            (the current grayscale frame, as a pyramid of
-             before — may be EMPTY)         wavelet block embeddings: 1024² → 512² → 256²
-                                            → 128² → 64² → 32²)
+INPUT   [ sparse 3-D context points | SEP | learned image tokens ]
+            (the cloud gathered            (the current grayscale frame -> [gray | sobel |
+             before — may be EMPTY)         local-variance] -> ConvNeXt-lite + FPN tokens)
 ENCODER  M Perceiver latents cross-attend the sequence, then L self-attention blocks
 OUTPUT  (1) camera pose  — 6-D rotation + translation, RELATIVE to the sparse context
-        (2) mesh-plane   — per-pixel depth emitted as 2-D Haar coefficients, inverted to a
-                           depth map and unprojected to a grid mesh in the context frame
+        (2) mesh-plane   — per-pixel depth emitted as a MULTI-LEVEL Haar pyramid (LL0 + J
+                           detail octaves), inverted to a depth map and unprojected to a
+                           grid mesh in the context frame
 ```
+
+**v2 redesign — to resolve small surfaces (tables, chairs, thin objects).**  v1 tokenised
+the image by *average-pooling* signed Haar detail bands, which annihilates the high
+frequencies that *are* a chair leg, and emitted a single Haar octave from global latents.
+v2 fixes the four stages where small-surface information was lost:
+
+* **Learned image embedding** (`waveletspace/encoder.py`, ≤10 M budget).  A ConvNeXt-lite +
+  FPN replaces the Haar-mean tokenizer; the input is grayscale + *computed* edge channels
+  (sobel / local-variance), so the path stays sensor-agnostic (visible / IR / night /
+  underwater).  The finest stride-4 feature map is handed to the decoder's local gather.
+* **Local → coarse routing.**  The coarse (LL) depth band now reads *local* image evidence
+  (`ll_local_head`), not only the global latents, so a chair's coarse depth can come from
+  the chair's own pixels instead of the scene average.
+* **Multi-level wavelet decode.**  The decoder emits LL0 + `J` detail octaves at
+  `plane_res=256`, so a thin object gets coefficients at several scales (deep detail path:
+  LocalAttn → conv-mix → LocalAttn over a window of the finest feature map).
+* **Losses that reward small surfaces.**  Edge-weighted depth L1 + multi-scale gradient
+  matching + detail-up-weighted multi-level wavelet, and a **bidirectional** chamfer for
+  model selection (so *failing to cover* a thin object is finally penalised).
 
 * **Context can be empty.**  With no prior points the sequence is just `[SEP | image]` and
   the pose is predicted in the frame the network anchors to; training randomly drops the
   context so both regimes are learned.
-* **Wavelet everywhere.**  The image is tokenised by its 2-D Haar coefficients per block at
-  every pyramid level, and the depth head *emits* 2-D Haar coefficients (inverted exactly by
-  the orthonormal synthesis filters) — the same multi-scale representation on both ends.
 * **Identity start.**  Zero-initialised coefficient heads give a flat plane at the mean
   scene depth, and a bias-initialised pose head starts at `R = I, t = 0` (the source
   viewpoint), so training only learns the *correction*.
 
-The encoder/decoder blocks (`waveletspace/blocks.py`) are the same Perceiver units used by
-the surface model's `PerceiverWaveNet`.
+The Perceiver encoder/decoder blocks (`waveletspace/blocks.py`) are the same units used by
+the surface model's `PerceiverWaveNet`; the depth field is still *emitted* in the Haar
+wavelet domain (`waveletspace/wavelet2d.py`).
 
 ---
 
@@ -86,20 +103,24 @@ Because unprojection and re-projection use the *same* intrinsics, the episode is
 self-consistent and needs no external calibration.  When DIODE is not present a synthetic
 scene generator keeps the tests and notebook runnable.
 
-**Losses** (mirroring the precursor monocular-scene model + the two new heads): log-depth
-L1 · normal-from-depth · wavelet-coefficient · camera translation · camera rotation.
-**Model selection / eval**: held-out (split by whole scene, no leakage) `chamfer(m)` and `logdepthL1`.
+**Losses** (v2, tuned to reward small surfaces): **edge-weighted** log-depth L1 ·
+**multi-scale gradient** matching · **multi-level** wavelet-coefficient (detail bands
+up-weighted) · low-weight normal · camera translation · camera rotation.
+**Model selection / eval**: held-out (split by whole scene, no leakage) **bidirectional**
+`chamfer(m)` and `logdepthL1`.
 
-The complete-model run used in the notebook (the full pyramid on the full train set, A100):
+The v2 run used in the notebook (learned ConvFPN embedding + multi-level Haar decode, A100):
 
 ```bash
-python train.py --epochs 30 --batch 16 --img-hw 1024 --plane-res 128 \
-    --levels 1024,512,256,128,64,32 --d 256 --M 256 --L 6 --workers 8 \
-    --max-scene-pts 150000 --splat-radius 2 --val-cap 256 --out waveletspace_full
+python train.py --epochs 30 --batch 8 --img-hw 512 --plane-res 256 \
+    --d 320 --M 384 --L 8 --workers 8 \
+    --max-scene-pts 200000 --splat-radius 2 --val-cap 256 --out waveletspace_full
 ```
 
-`--max-scene-pts` (cloud density) and `--splat-radius` keep the high-resolution renders filled;
-`--val-cap` bounds the per-epoch held-out evaluation; resume with `--resume assets/waveletspace_full_latest.pt`.
+`bf16` autocast and a warmup+cosine LR are on by default; `--max-scene-pts` (cloud density,
+edge-biased) keeps thin structures in the GT; `--splat-radius` fills the input render (GT is
+resolution-aware); resume with `--resume assets/waveletspace_full_latest.pt`.  The model is
+~19.5 M params (≈2.9 M image-embed, ≈16.6 M main) of the 30 M+10 M budget.
 
 ---
 
@@ -108,9 +129,10 @@ python train.py --epochs 30 --batch 16 --img-hw 1024 --plane-res 128 \
 | path | what |
 |------|------|
 | `waveletspace/blocks.py`        | shared Perceiver blocks + Fourier encoding + farthest-point sampling (same units as the surface model). |
-| `waveletspace/wavelet2d.py`     | 2-D Haar transform + the `WaveletPyramidTokenizer` (image → multi-scale wavelet block tokens). |
+| `waveletspace/encoder.py`       | the learned image embedding: grayscale→edge adapter + ConvNeXt-lite + FPN tokenizer + windowed neighbour gather. |
+| `waveletspace/wavelet2d.py`     | 2-D Haar transform + multi-level `haar_analysis` / `haar_synthesis` for the decoder + wavelet loss. |
 | `waveletspace/geometry.py`      | pinhole camera, 6-D rotations, (un)projection, the splat renderer, and smooth-spline fly-throughs. |
-| `waveletspace/model.py`         | `WaveletSpaceNet` — the encoder + pose head + position-conditioned mesh-plane decoder. |
+| `waveletspace/model.py`         | `WaveletSpaceNet` — learned-embedding encoder + pose head + multi-level wavelet mesh-plane decoder. |
 | `waveletspace/diode.py`         | DIODE loader, scene-from-view, fly-through episode generation, the per-epoch-randomised `FlythroughDataset`. |
 | `waveletspace/losses.py`        | depth / normal / wavelet / pose losses + chamfer(m) eval. |
 | `waveletspace/infer_helpers.py` | mesh-plane (grid mesh) construction + `.obj` export. |

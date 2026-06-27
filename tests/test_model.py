@@ -10,7 +10,9 @@ from waveletspace.infer_helpers import mesh_plane_verts
 
 def _net():
     torch.manual_seed(0)
-    return WaveletSpaceNet(d=64, M=32, L=2, heads=4, levels=(128, 64, 32), plane_res=32, k=6, n_ctx=16)
+    return WaveletSpaceNet(d=64, M=32, L=2, heads=4, plane_res=32, wave_levels=2, win=3,
+                           n_ctx=16, img_size=64, enc_widths=(24, 32, 48, 64),
+                           enc_depths=(1, 1, 1, 1), fpn_dim=32)
 
 
 def test_haar2d_invertible():
@@ -24,7 +26,9 @@ def test_forward_shapes_and_rotation():
     ctx = torch.rand(2, 100, 3) * 4 - 2
     out = net(img, ctx)
     assert out["depth"].shape == (2, 1, 32, 32)
-    assert out["coeffs"].shape == (2, 4, 16, 16)
+    assert out["logdepth"].shape == (2, 1, 32, 32)
+    assert out["ll0"].shape == (2, 1, 8, 8)                  # coarse LL at plane_res/2**wave_levels
+    assert [d.shape for d in out["dets"]] == [(2, 3, 8, 8), (2, 3, 16, 16)]   # detail octaves
     assert out["R"].shape == (2, 3, 3) and out["t"].shape == (2, 3)
     R = out["R"]
     assert torch.allclose(torch.bmm(R, R.transpose(1, 2)), torch.eye(3)[None].expand(2, -1, -1), atol=1e-4)
