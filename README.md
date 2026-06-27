@@ -57,10 +57,12 @@ python infer.py --demo --device cpu --out out/plane.obj
 
 ### Google Colab
 
-`notebooks/waveletspace_colab.ipynb` clones this repo, installs, downloads the DIODE
-validation split, runs the tests, visualises a generated fly-through, trains on the Colab
-GPU and runs inference.  Open it in Colab (after this repo is pushed to
-`https://github.com/OlegJakushkin/WaveletSpaceNet`).
+`notebooks/waveletspace_colab.ipynb` clones this repo, installs, **mounts Google Drive**,
+downloads the DIODE validation split (cached on Drive so the ~2.8 GB download happens once),
+runs the tests, visualises a generated fly-through, trains on the Colab GPU and runs inference.
+Trained weights (`assets/`) and logs (`renders/`) are linked to Drive, so **every checkpoint is
+saved to `MyDrive/WaveletSpaceNet/` during training** and a snapshot of the generated training
+data is written there too.  Click the badge above (or open the notebook in Colab).
 
 ---
 
