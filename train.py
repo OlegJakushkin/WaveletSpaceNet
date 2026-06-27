@@ -63,7 +63,10 @@ def main():
     ap.add_argument("--ctx-min", type=int, default=8)
     ap.add_argument("--ctx-max", type=int, default=64)
     ap.add_argument("--val-frac", type=float, default=0.1)
+    ap.add_argument("--val-cap", type=int, default=256, help="cap #val episodes/epoch (0 = all)")
     ap.add_argument("--cap", type=int, default=0, help="cap #scenes (0 = all)")
+    ap.add_argument("--max-scene-pts", type=int, default=60000, help="points kept per scene cloud")
+    ap.add_argument("--splat-radius", type=int, default=1, help="render splat radius (raise for dense/hi-res)")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--diode-root", type=str, default="auto")
     ap.add_argument("--device", type=str,
@@ -98,11 +101,14 @@ def main():
         if info["n_scenes"] <= 8:
             print(f"  ! only {info['n_scenes']} distinct scenes — val chamfer is high-variance", flush=True)
 
-    cfg = dict(img_hw=a.img_hw, plane_res=a.plane_res, n_ctx_points=a.n_ctx_points)
+    cfg = dict(img_hw=a.img_hw, plane_res=a.plane_res, n_ctx_points=a.n_ctx_points,
+               radius=a.splat_radius)
     tr = D.FlythroughDataset(root, views=tr_views, synthetic=synth, seed=1,
+                             max_scene_pts=a.max_scene_pts,
                              length=(a.cap or None) if synth else None, **cfg)
+    val_len = 16 if synth else (a.val_cap or None)
     vl = D.FlythroughDataset(root, views=vl_views, synthetic=synth, seed=777,
-                             length=16 if synth else None, **cfg)
+                             max_scene_pts=a.max_scene_pts, length=val_len, **cfg)
     if synth and a.smoke:
         tr._len = a.cap
     ld = torch.utils.data.DataLoader(tr, batch_size=a.batch, shuffle=True,

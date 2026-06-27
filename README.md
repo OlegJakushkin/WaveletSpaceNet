@@ -57,12 +57,13 @@ python infer.py --demo --device cpu --out out/plane.obj
 
 ### Google Colab
 
-`notebooks/waveletspace_colab.ipynb` clones this repo, installs, **mounts Google Drive**,
-downloads the DIODE validation split (cached on Drive so the ~2.8 GB download happens once),
-runs the tests, visualises a generated fly-through, trains on the Colab GPU and runs inference.
-Trained weights (`assets/`) and logs (`renders/`) are linked to Drive, so **every checkpoint is
-saved to `MyDrive/WaveletSpaceNet/` during training** and a snapshot of the generated training
-data is written there too.  Click the badge above (or open the notebook in Colab).
+`notebooks/waveletspace_colab.ipynb` is tuned for a **Colab A100 40 GB** runtime: it clones this
+repo, installs, **mounts Google Drive**, **streams the complete DIODE train set (~87 GB)**, runs the
+tests, visualises a generated fly-through, trains the **complete model** (full `1024→32` pyramid,
+`plane_res=128`) and runs inference.  Trained weights (`assets/`) and logs (`renders/`) are linked to
+Drive, so **every checkpoint is saved to `MyDrive/WaveletSpaceNet/` during training** (resumable) and a
+snapshot of the generated training data is written there too.  Set `FULL_TRAIN = False` in the data
+cell to use the small 2.8 GB validation split instead.  Click the badge above (or open it in Colab).
 
 ---
 
@@ -87,7 +88,18 @@ scene generator keeps the tests and notebook runnable.
 
 **Losses** (mirroring the precursor monocular-scene model + the two new heads): log-depth
 L1 · normal-from-depth · wavelet-coefficient · camera translation · camera rotation.
-**Model selection / eval**: held-out `chamfer(m)` and `logdepthL1`.
+**Model selection / eval**: held-out (split by whole scene, no leakage) `chamfer(m)` and `logdepthL1`.
+
+The complete-model run used in the notebook (the full pyramid on the full train set, A100):
+
+```bash
+python train.py --epochs 30 --batch 16 --img-hw 1024 --plane-res 128 \
+    --levels 1024,512,256,128,64,32 --d 256 --M 256 --L 6 --workers 8 \
+    --max-scene-pts 150000 --splat-radius 2 --val-cap 256 --out waveletspace_full
+```
+
+`--max-scene-pts` (cloud density) and `--splat-radius` keep the high-resolution renders filled;
+`--val-cap` bounds the per-epoch held-out evaluation; resume with `--resume assets/waveletspace_full_latest.pt`.
 
 ---
 

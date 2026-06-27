@@ -192,7 +192,7 @@ def sample_context(scene, n_pts, rng, *, noise_frac=0.10, n_outliers=10):
 
 def make_episode(scene, rng, *, img_hw=256, plane_res=64, n_ctx_points=512,
                  vfov=60.0, ctx_noise=0.10, n_outliers=10, n_ctrl=4, move_frac=0.25,
-                 chamfer_pts=4096):
+                 chamfer_pts=4096, radius=1):
     """One training/eval episode dict from a scene: render a random fly-through frame,
     sample noised context, and package GT pose + depth + a chamfer reference cloud."""
     targets, _ = scene.subsample(96, rng)                # look-at candidates spanning the scene
@@ -211,7 +211,7 @@ def make_episode(scene, rng, *, img_hw=256, plane_res=64, n_ctx_points=512,
         if fill > 0.12:
             break
     R, t = Rs[best_f], ts[best_f]
-    gray, depth, mask, Kp = noised_render(scene, R, t, img_hw, plane_res, rng, vfov=vfov)
+    gray, depth, mask, Kp = noised_render(scene, R, t, img_hw, plane_res, rng, vfov=vfov, radius=radius)
     ctx = sample_context(scene, n_ctx_points, rng, noise_frac=ctx_noise, n_outliers=n_outliers)
     sp, _ = scene.subsample(chamfer_pts, rng)
     return {
@@ -239,10 +239,10 @@ class FlythroughDataset(torch.utils.data.Dataset):
     def __init__(self, root: str | None = "auto", *, img_hw=256, plane_res=64,
                  n_ctx_points=512, vfov=60.0, ctx_noise=0.10, n_outliers=10,
                  max_scene_pts=60000, chamfer_pts=4096, length=None, seed=0,
-                 synthetic=False, move_frac=0.25, views=None):
+                 synthetic=False, move_frac=0.25, views=None, radius=1):
         self.cfg = dict(img_hw=img_hw, plane_res=plane_res, n_ctx_points=n_ctx_points,
                         vfov=vfov, ctx_noise=ctx_noise, n_outliers=n_outliers,
-                        chamfer_pts=chamfer_pts, move_frac=move_frac)
+                        chamfer_pts=chamfer_pts, move_frac=move_frac, radius=radius)
         self.max_scene_pts = max_scene_pts
         self.seed = seed
         self.epoch = 0
