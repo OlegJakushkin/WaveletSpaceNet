@@ -1,0 +1,45 @@
+# WaveletSpaceNet — sparse context + wavelet image pyramid -> mesh-plane + camera pose.
+# GPU, no host setup needed (requires the NVIDIA Container Toolkit).
+#
+#   docker compose build
+#   docker compose run --rm test                              # pytest
+#   docker compose run --rm train --epochs 40 --batch 8       # train on DIODE fly-throughs
+#   docker compose run --rm infer --demo --out out/plane.obj  # one fly-through frame -> mesh-plane
+#
+# The repo is bind-mounted at /workspace, so data/ (DIODE), assets/ (weights) and out/
+# live on the host.  Put DIODE under data/diode/val/... (see README / notebook).
+
+x-gpu: &gpu
+  build: .
+  image: waveletspacenet:latest
+  volumes:
+    - ./:/workspace
+  shm_size: "8gb"
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  # train on randomised DIODE fly-throughs.  Append train.py flags after the service name.
+  train:
+    <<: *gpu
+    entrypoint: ["python", "train.py"]
+
+  # image (+ optional context) -> mesh-plane .obj + camera pose.  Append infer.py flags.
+  infer:
+    <<: *gpu
+    entrypoint: ["python", "infer.py"]
+
+  # run the test suite (a single fly-through generates + trains locally).
+  test:
+    <<: *gpu
+    entrypoint: ["python", "-m", "pytest", "tests/", "-q"]
+
+  # interactive shell in the GPU container.
+  shell:
+    <<: *gpu
+    entrypoint: ["bash"]

@@ -1,0 +1,12 @@
+# WaveletSpaceNet — sparse context + wavelet image pyramid -> mesh-plane + camera pose.
+# GPU PyTorch is expected for training (CUDA); CPU works for the smoke tests / inference.
+# The Docker image installs these on top of pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime.
+numpy>=1.26
+torch>=2.2
+
+# data: DIODE RGB frames + figures / render panels
+pillow>=10.0
+matplotlib>=3.7
+
+# tests
+pytest>=7.0

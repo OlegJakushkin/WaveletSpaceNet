@@ -1,0 +1,22 @@
+# data (download DIODE separately; see the notebook / README)
+data/
+*.tar.gz
+*.zip
+
+# trained weights & outputs
+assets/*.pt
+out/
+renders/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+
+# os / editor
+.DS_Store
+Thumbs.db
